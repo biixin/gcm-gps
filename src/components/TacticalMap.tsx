@@ -24,6 +24,8 @@ type GoogleInfoWindow = any;
 type GoogleLatLng = { lat: number; lng: number };
 
 const googleMapsScriptId = 'google-maps-js-api';
+const targetGpsAccuracyMeters = 35;
+const maxGpsRefineAttempts = 8;
 
 declare global {
   interface Window {
@@ -42,6 +44,8 @@ export function TacticalMap({ locations, zones, satellite, heatmap, onCreateZone
   const draftPolylineRef = useRef<GooglePolyline | null>(null);
   const infoWindowRef = useRef<GoogleInfoWindow | null>(null);
   const gpsWatchRef = useRef<number | null>(null);
+  const gpsRefineTimeoutRef = useRef<number | null>(null);
+  const gpsRefineAttemptsRef = useRef(0);
   const gpsCenteredRef = useRef(false);
   const bestGpsAccuracyRef = useRef<number | null>(null);
   const drawModeRef = useRef<DrawMode>('none');
@@ -120,6 +124,7 @@ export function TacticalMap({ locations, zones, satellite, heatmap, onCreateZone
     return () => {
       mounted = false;
       if (gpsWatchRef.current !== null) navigator.geolocation.clearWatch(gpsWatchRef.current);
+      if (gpsRefineTimeoutRef.current !== null) window.clearTimeout(gpsRefineTimeoutRef.current);
       Object.values(markersRef.current).forEach((marker) => marker.setMap(null));
       Object.values(zonesRef.current).forEach((zone) => zone.setMap(null));
       heatRef.current.forEach((circle) => circle.setMap(null));
@@ -165,7 +170,7 @@ export function TacticalMap({ locations, zones, satellite, heatmap, onCreateZone
     }
 
     setGpsStatus('Solicitando GPS');
-    requestFreshGpsFix(maps, map);
+    requestFreshGpsFix(maps, map, true);
     gpsWatchRef.current = navigator.geolocation.watchPosition(
       (position) => handleGpsPosition(maps, map, position),
       (error) => setGpsStatus(getGpsErrorLabel(error)),
@@ -173,14 +178,17 @@ export function TacticalMap({ locations, zones, satellite, heatmap, onCreateZone
     );
   }
 
-  function requestFreshGpsFix(maps = googleRef.current, map = mapRef.current) {
+  function requestFreshGpsFix(maps = googleRef.current, map = mapRef.current, resetAttempts = false) {
     if (!maps || !map || !navigator.geolocation) return;
     if (!window.isSecureContext) {
       setGpsStatus('GPS precisa de HTTPS no celular');
       return;
     }
 
-    setGpsStatus('Buscando precisao alta');
+    if (resetAttempts) gpsRefineAttemptsRef.current = 0;
+    if (gpsRefineTimeoutRef.current !== null) window.clearTimeout(gpsRefineTimeoutRef.current);
+
+    setGpsStatus('Buscando GPS preciso');
     navigator.geolocation.getCurrentPosition(
       (position) => handleGpsPosition(maps, map, position, true),
       (error) => setGpsStatus(getGpsErrorLabel(error)),
@@ -194,12 +202,15 @@ export function TacticalMap({ locations, zones, satellite, heatmap, onCreateZone
       lng: position.coords.longitude,
     };
     const accuracy = Math.round(position.coords.accuracy);
+    const ageMs = Date.now() - position.timestamp;
     const previousBest = bestGpsAccuracyRef.current;
     const isBetterFix = previousBest === null || accuracy <= previousBest;
+    const isFresh = ageMs < 15000;
 
     setGpsAccuracy(accuracy);
-    setGpsStatus(getAccuracyLabel(accuracy));
+    setGpsStatus(getAccuracyLabel(accuracy, isFresh));
     syncGpsPosition(maps, map, current, accuracy);
+    scheduleGpsRefineIfNeeded(maps, map, accuracy, isFresh);
 
     if (forceCenter || !gpsCenteredRef.current || isBetterFix) {
       map.panTo(current);
@@ -208,6 +219,18 @@ export function TacticalMap({ locations, zones, satellite, heatmap, onCreateZone
     }
 
     if (isBetterFix) bestGpsAccuracyRef.current = accuracy;
+  }
+
+  function scheduleGpsRefineIfNeeded(maps: GoogleMapsApi, map: GoogleMap, accuracy: number, isFresh: boolean) {
+    if (accuracy <= targetGpsAccuracyMeters && isFresh) return;
+    if (gpsRefineAttemptsRef.current >= maxGpsRefineAttempts) return;
+
+    gpsRefineAttemptsRef.current += 1;
+    const delay = gpsRefineAttemptsRef.current <= 2 ? 2500 : 5000;
+    if (gpsRefineTimeoutRef.current !== null) window.clearTimeout(gpsRefineTimeoutRef.current);
+    gpsRefineTimeoutRef.current = window.setTimeout(() => {
+      requestFreshGpsFix(maps, map);
+    }, delay);
   }
 
   function centerOnGps() {
@@ -278,7 +301,7 @@ export function TacticalMap({ locations, zones, satellite, heatmap, onCreateZone
         <MapTool active={drawMode === 'polygon'} label="Poligono" icon={<Pentagon size={17} />} onClick={() => setDrawMode(drawMode === 'polygon' ? 'none' : 'polygon')} />
         <MapTool active={drawMode === 'none'} label="Cursor" icon={<MousePointer2 size={17} />} onClick={clearDrawing} />
         <MapTool active={false} label="GPS" icon={<LocateFixed size={17} />} onClick={centerOnGps} />
-        <MapTool active={false} label="Atualizar GPS" icon={<RefreshCw size={17} />} onClick={() => requestFreshGpsFix()} />
+        <MapTool active={false} label="Atualizar GPS" icon={<RefreshCw size={17} />} onClick={() => requestFreshGpsFix(undefined, undefined, true)} />
         {drawMode === 'polygon' && (
           <button onClick={finishPolygon} className="h-10 rounded bg-sky-400 px-3 text-xs font-bold uppercase text-slate-950">
             concluir
@@ -301,6 +324,12 @@ export function TacticalMap({ locations, zones, satellite, heatmap, onCreateZone
           {zones.length} zonas
         </span>
       </div>
+
+      {gpsAccuracy !== null && gpsAccuracy > 100 && (
+        <div className="glass-panel absolute left-3 top-24 z-20 max-w-[320px] rounded px-3 py-2 text-xs leading-5 text-amber-100">
+          GPS com baixa precisao. No celular, ative Localizacao Precisa e aguarde alguns segundos em area aberta.
+        </div>
+      )}
 
       {drawMode !== 'none' && (
         <button onClick={clearDrawing} className="absolute right-3 top-36 z-20 flex h-10 items-center gap-2 rounded border border-red-400/25 bg-red-500/12 px-3 text-xs text-red-100 md:top-36">
@@ -515,10 +544,12 @@ function syncGpsPosition(maps: GoogleMapsApi, map: GoogleMap, position: GoogleLa
   }
 }
 
-function getAccuracyLabel(accuracy: number) {
+function getAccuracyLabel(accuracy: number, isFresh = true) {
+  if (!isFresh) return 'GPS antigo, atualizando';
   if (accuracy <= 25) return 'GPS preciso';
-  if (accuracy <= 80) return 'GPS aproximado';
-  return 'GPS com baixa precisao';
+  if (accuracy <= targetGpsAccuracyMeters) return 'GPS bom';
+  if (accuracy <= 100) return 'GPS aproximado';
+  return 'GPS ruim, refinando';
 }
 
 function getGpsErrorLabel(error: GeolocationPositionError) {
