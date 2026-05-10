@@ -4,7 +4,6 @@ import { ChevronDown, LocateFixed, LogOut, Moon, Navigation, Shield, Sun } from 
 type GoogleMapsApi = any;
 type GoogleMap = any;
 type GoogleMarker = any;
-type GoogleCircle = any;
 
 type Theme = 'light' | 'dark';
 
@@ -20,6 +19,7 @@ interface VtrLocation {
   lat: number;
   lng: number;
   speed: number;
+  heading: number;
   accuracy: number;
   updatedAt: number;
   online: boolean;
@@ -33,6 +33,8 @@ const googleMapsScriptId = 'google-maps-js-api';
 const defaultCenter = { lat: -22.7857, lng: -43.3049 };
 const movementThresholdMeters = 18;
 const minimumGpsAccuracyMeters = 120;
+const suspiciousJumpMeters = 90;
+const smoothingFactor = 0.38;
 
 declare global {
   interface Window {
@@ -185,9 +187,9 @@ function GpsWorkspace({
   const mapsRef = useRef<GoogleMapsApi | null>(null);
   const mapNodeRef = useRef<HTMLDivElement | null>(null);
   const markersRef = useRef<Record<string, GoogleMarker>>({});
-  const accuracyRef = useRef<GoogleCircle | null>(null);
   const watchRef = useRef<number | null>(null);
   const lastAcceptedRef = useRef<VtrLocation | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
   const googleMapsKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined;
 
   const onlineLocations = useMemo(
@@ -219,6 +221,7 @@ function GpsWorkspace({
     return () => {
       mounted = false;
       if (watchRef.current !== null) navigator.geolocation.clearWatch(watchRef.current);
+      if (animationFrameRef.current !== null) cancelAnimationFrame(animationFrameRef.current);
     };
   }, [googleMapsKey]);
 
@@ -258,6 +261,7 @@ function GpsWorkspace({
       lat: position.coords.latitude,
       lng: position.coords.longitude,
       speed: Math.max(0, Math.round((position.coords.speed ?? 0) * 3.6)),
+      heading: Math.round(position.coords.heading ?? lastAcceptedRef.current?.heading ?? 0),
       accuracy: Math.round(position.coords.accuracy),
       updatedAt: Date.now(),
       online: true,
@@ -266,9 +270,13 @@ function GpsWorkspace({
 
     const last = lastAcceptedRef.current;
     const movedMeters = last ? distanceMeters(last, next) : Number.POSITIVE_INFINITY;
-    const improvedAccuracy = last ? next.accuracy + 12 < last.accuracy : true;
 
-    if (last && movedMeters < movementThresholdMeters && !improvedAccuracy) {
+    if (last && next.accuracy > Math.max(minimumGpsAccuracyMeters, last.accuracy * 1.7) && movedMeters > suspiciousJumpMeters) {
+      setGpsStatus(`Ignorando salto impreciso (${next.accuracy}m)`);
+      return;
+    }
+
+    if (last && movedMeters < movementThresholdMeters) {
       setGpsStatus(`GPS estavel (${next.accuracy}m)`);
       return;
     }
@@ -278,13 +286,14 @@ function GpsWorkspace({
       return;
     }
 
-    lastAcceptedRef.current = next;
+    const accepted = last ? smoothLocation(last, next) : next;
+    lastAcceptedRef.current = accepted;
     setGpsStatus(next.accuracy <= 35 ? `GPS preciso (${next.accuracy}m)` : `GPS aproximado (${next.accuracy}m)`);
-    map.panTo({ lat: next.lat, lng: next.lng });
+    map.panTo({ lat: accepted.lat, lng: accepted.lng });
     if (!last) map.setZoom(17);
-    syncAccuracyCircle(maps, map, next);
+    syncOwnVehicle(maps, map, accepted, animationFrameRef);
 
-    const merged = upsertLocation(getStoredLocations(), next);
+    const merged = upsertLocation(getStoredLocations(), accepted);
     saveLocations(merged);
     onLocations(merged);
   }
@@ -346,7 +355,7 @@ function GpsWorkspace({
             <article className={location.id === selectedId ? 'vtr-card selected' : 'vtr-card'} key={location.id}>
               <div>
                 <strong>{location.name}</strong>
-                <span>{location.speed} km/h · {location.accuracy}m</span>
+                <span>{location.speed} km/h | {location.accuracy}m</span>
               </div>
               <button onClick={() => locateVtr(location)}>
                 <LocateFixed size={16} />
@@ -384,7 +393,8 @@ function loadGoogleMaps(apiKey: string): Promise<GoogleMapsApi> {
 }
 
 function syncFleetMarkers(maps: GoogleMapsApi, map: GoogleMap, locations: VtrLocation[], markers: Record<string, GoogleMarker>, selectedId: string | null) {
-  const activeIds = new Set(locations.map((location) => location.id));
+  const fleetLocations = locations.filter((location) => !location.isSelf);
+  const activeIds = new Set(fleetLocations.map((location) => location.id));
   Object.entries(markers).forEach(([id, marker]) => {
     if (!activeIds.has(id)) {
       marker.setMap(null);
@@ -392,52 +402,39 @@ function syncFleetMarkers(maps: GoogleMapsApi, map: GoogleMap, locations: VtrLoc
     }
   });
 
-  locations.forEach((location) => {
+  fleetLocations.forEach((location) => {
     const position = { lat: location.lat, lng: location.lng };
-    const icon = {
-      path: maps.SymbolPath.CIRCLE,
-      scale: location.id === selectedId ? 12 : 9,
-      fillColor: location.isSelf ? '#176b3a' : '#1057a8',
-      fillOpacity: 1,
-      strokeColor: '#ffffff',
-      strokeWeight: 3,
-    };
+    const icon = buildVehicleIcon(location, location.id === selectedId);
 
     if (!markers[location.id]) {
       markers[location.id] = new maps.Marker({
         map,
         position,
-        title: `${location.name} · ${location.speed} km/h`,
+        title: `${location.name} | ${location.speed} km/h`,
         icon,
       });
       return;
     }
 
     markers[location.id].setPosition(position);
-    markers[location.id].setTitle(`${location.name} · ${location.speed} km/h`);
+    markers[location.id].setTitle(`${location.name} | ${location.speed} km/h`);
     markers[location.id].setIcon(icon);
   });
 }
 
-function syncAccuracyCircle(maps: GoogleMapsApi, map: GoogleMap, location: VtrLocation) {
+function syncOwnVehicle(maps: GoogleMapsApi, map: GoogleMap, location: VtrLocation, animationFrameRef: React.MutableRefObject<number | null>) {
   const center = { lat: location.lat, lng: location.lng };
   if (!map.__selfMarker) {
     map.__selfMarker = new maps.Marker({
       map,
       position: center,
       title: location.name,
-      icon: {
-        path: maps.SymbolPath.FORWARD_CLOSED_ARROW,
-        scale: 5,
-        fillColor: '#176b3a',
-        fillOpacity: 1,
-        strokeColor: '#ffffff',
-        strokeWeight: 2,
-      },
+      icon: buildVehicleIcon(location, true),
       zIndex: 999,
     });
   } else {
-    map.__selfMarker.setPosition(center);
+    animateMarkerTo(map.__selfMarker, center, animationFrameRef);
+    map.__selfMarker.setIcon(buildVehicleIcon(location, true));
   }
 
   if (!map.__accuracyCircle) {
@@ -446,16 +443,65 @@ function syncAccuracyCircle(maps: GoogleMapsApi, map: GoogleMap, location: VtrLo
       center,
       radius: location.accuracy,
       strokeColor: '#176b3a',
-      strokeOpacity: 0.4,
+      strokeOpacity: 0.32,
       strokeWeight: 1,
       fillColor: '#176b3a',
-      fillOpacity: 0.1,
+      fillOpacity: 0.08,
       clickable: false,
     });
   } else {
     map.__accuracyCircle.setCenter(center);
     map.__accuracyCircle.setRadius(location.accuracy);
   }
+}
+
+function buildVehicleIcon(location: Pick<VtrLocation, 'isSelf' | 'heading'>, selected = false) {
+  const fillColor = location.isSelf ? '#176b3a' : '#1057a8';
+  return {
+    path: 'M -8 -16 C -10 -16 -12 -13 -12 -10 L -12 10 C -12 14 -9 17 -5 17 L 5 17 C 9 17 12 14 12 10 L 12 -10 C 12 -13 10 -16 8 -16 Z M -6 -9 L 6 -9 L 5 -2 L -5 -2 Z M -8 6 L -3 6 L -3 12 L -8 12 Z M 3 6 L 8 6 L 8 12 L 3 12 Z M -9 -13 L -13 -8 L -12 -3 L -9 -7 Z M 9 -13 L 13 -8 L 12 -3 L 9 -7 Z',
+    anchor: { x: 0, y: 0 },
+    rotation: location.heading || 0,
+    scale: selected ? 1.18 : 1,
+    fillColor,
+    fillOpacity: 1,
+    strokeColor: '#ffffff',
+    strokeWeight: 1.8,
+  };
+}
+
+function animateMarkerTo(marker: GoogleMarker, target: { lat: number; lng: number }, frameRef: React.MutableRefObject<number | null>) {
+  const startPosition = marker.getPosition();
+  if (!startPosition) {
+    marker.setPosition(target);
+    return;
+  }
+
+  const start = { lat: startPosition.lat(), lng: startPosition.lng() };
+  const startTime = performance.now();
+  const duration = 650;
+
+  if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
+
+  const step = (time: number) => {
+    const progress = Math.min(1, (time - startTime) / duration);
+    const eased = 1 - (1 - progress) ** 3;
+    marker.setPosition({
+      lat: start.lat + (target.lat - start.lat) * eased,
+      lng: start.lng + (target.lng - start.lng) * eased,
+    });
+    if (progress < 1) frameRef.current = requestAnimationFrame(step);
+  };
+
+  frameRef.current = requestAnimationFrame(step);
+}
+
+function smoothLocation(last: VtrLocation, next: VtrLocation): VtrLocation {
+  return {
+    ...next,
+    lat: last.lat + (next.lat - last.lat) * smoothingFactor,
+    lng: last.lng + (next.lng - last.lng) * smoothingFactor,
+    accuracy: Math.min(next.accuracy, Math.max(last.accuracy, next.accuracy)),
+  };
 }
 
 function getStoredAccounts() {
