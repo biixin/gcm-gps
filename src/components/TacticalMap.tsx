@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type MutableRefObject, type ReactNode } from 'react';
-import { Circle, Crosshair, Hexagon, LocateFixed, MousePointer2, Pentagon, Satellite, X } from 'lucide-react';
+import { Circle, Crosshair, Hexagon, LocateFixed, MousePointer2, Pentagon, RefreshCw, Satellite, X } from 'lucide-react';
 import { clsx } from 'clsx';
 import type { DeviceLocation, RiskLevel, RiskZone } from '../types';
 import { DEFAULT_CENTER } from '../utils/geo';
@@ -42,6 +42,8 @@ export function TacticalMap({ locations, zones, satellite, heatmap, onCreateZone
   const draftPolylineRef = useRef<GooglePolyline | null>(null);
   const infoWindowRef = useRef<GoogleInfoWindow | null>(null);
   const gpsWatchRef = useRef<number | null>(null);
+  const gpsCenteredRef = useRef(false);
+  const bestGpsAccuracyRef = useRef<number | null>(null);
   const drawModeRef = useRef<DrawMode>('none');
   const polygonRef = useRef<[number, number][]>([]);
   const [drawMode, setDrawMode] = useState<DrawMode>('none');
@@ -49,6 +51,7 @@ export function TacticalMap({ locations, zones, satellite, heatmap, onCreateZone
   const [zoneName, setZoneName] = useState('Zona personalizada');
   const [mapReady, setMapReady] = useState(false);
   const [gpsStatus, setGpsStatus] = useState('Aguardando GPS');
+  const [gpsAccuracy, setGpsAccuracy] = useState<number | null>(null);
   const googleMapsKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string | undefined;
 
   useEffect(() => {
@@ -151,31 +154,70 @@ export function TacticalMap({ locations, zones, satellite, heatmap, onCreateZone
   }, [zones, mapReady]);
 
   function startGpsWatch(maps: GoogleMapsApi, map: GoogleMap) {
+    if (!window.isSecureContext) {
+      setGpsStatus('GPS precisa de HTTPS no celular');
+      return;
+    }
+
     if (!navigator.geolocation) {
       setGpsStatus('GPS indisponivel');
       return;
     }
 
     setGpsStatus('Solicitando GPS');
+    requestFreshGpsFix(maps, map);
     gpsWatchRef.current = navigator.geolocation.watchPosition(
-      (position) => {
-        const current = {
-          lat: position.coords.latitude,
-          lng: position.coords.longitude,
-        };
-        setGpsStatus('GPS em tempo real');
-        syncGpsPosition(maps, map, current, position.coords.accuracy);
-      },
-      () => setGpsStatus('Permissao de GPS negada'),
-      { enableHighAccuracy: true, maximumAge: 5000, timeout: 12000 },
+      (position) => handleGpsPosition(maps, map, position),
+      (error) => setGpsStatus(getGpsErrorLabel(error)),
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 25000 },
     );
+  }
+
+  function requestFreshGpsFix(maps = googleRef.current, map = mapRef.current) {
+    if (!maps || !map || !navigator.geolocation) return;
+    if (!window.isSecureContext) {
+      setGpsStatus('GPS precisa de HTTPS no celular');
+      return;
+    }
+
+    setGpsStatus('Buscando precisao alta');
+    navigator.geolocation.getCurrentPosition(
+      (position) => handleGpsPosition(maps, map, position, true),
+      (error) => setGpsStatus(getGpsErrorLabel(error)),
+      { enableHighAccuracy: true, maximumAge: 0, timeout: 30000 },
+    );
+  }
+
+  function handleGpsPosition(maps: GoogleMapsApi, map: GoogleMap, position: GeolocationPosition, forceCenter = false) {
+    const current = {
+      lat: position.coords.latitude,
+      lng: position.coords.longitude,
+    };
+    const accuracy = Math.round(position.coords.accuracy);
+    const previousBest = bestGpsAccuracyRef.current;
+    const isBetterFix = previousBest === null || accuracy <= previousBest;
+
+    setGpsAccuracy(accuracy);
+    setGpsStatus(getAccuracyLabel(accuracy));
+    syncGpsPosition(maps, map, current, accuracy);
+
+    if (forceCenter || !gpsCenteredRef.current || isBetterFix) {
+      map.panTo(current);
+      map.setZoom(accuracy <= 30 ? 18 : accuracy <= 80 ? 17 : 16);
+      gpsCenteredRef.current = true;
+    }
+
+    if (isBetterFix) bestGpsAccuracyRef.current = accuracy;
   }
 
   function centerOnGps() {
     const map = mapRef.current;
     const marker = map?.__gpsMarker;
     const position = marker?.getPosition();
-    if (!map || !position) return;
+    if (!map || !position) {
+      requestFreshGpsFix();
+      return;
+    }
     map.panTo(position);
     map.setZoom(Math.max(map.getZoom() ?? 14, 16));
   }
@@ -236,6 +278,7 @@ export function TacticalMap({ locations, zones, satellite, heatmap, onCreateZone
         <MapTool active={drawMode === 'polygon'} label="Poligono" icon={<Pentagon size={17} />} onClick={() => setDrawMode(drawMode === 'polygon' ? 'none' : 'polygon')} />
         <MapTool active={drawMode === 'none'} label="Cursor" icon={<MousePointer2 size={17} />} onClick={clearDrawing} />
         <MapTool active={false} label="GPS" icon={<LocateFixed size={17} />} onClick={centerOnGps} />
+        <MapTool active={false} label="Atualizar GPS" icon={<RefreshCw size={17} />} onClick={() => requestFreshGpsFix()} />
         {drawMode === 'polygon' && (
           <button onClick={finishPolygon} className="h-10 rounded bg-sky-400 px-3 text-xs font-bold uppercase text-slate-950">
             concluir
@@ -251,6 +294,7 @@ export function TacticalMap({ locations, zones, satellite, heatmap, onCreateZone
         <span className="glass-panel flex h-10 items-center gap-2 rounded px-3 text-xs text-sky-100">
           <Crosshair size={15} />
           {gpsStatus}
+          {gpsAccuracy !== null && ` (${gpsAccuracy}m)`}
         </span>
         <span className="glass-panel flex h-10 items-center gap-2 rounded px-3 text-xs text-sky-100">
           <Hexagon size={15} />
@@ -444,13 +488,13 @@ function syncGpsPosition(maps: GoogleMapsApi, map: GoogleMap, position: GoogleLa
     map.__gpsMarker = new maps.Marker({
       map,
       position,
-      title: 'Sua posicao GPS',
+      title: buildGpsTitle(accuracy),
       icon: markerIcon,
       zIndex: 999,
     });
-    map.panTo(position);
   } else {
     map.__gpsMarker.setPosition(position);
+    map.__gpsMarker.setTitle(buildGpsTitle(accuracy));
   }
 
   if (!map.__gpsAccuracy) {
@@ -469,6 +513,23 @@ function syncGpsPosition(maps: GoogleMapsApi, map: GoogleMap, position: GoogleLa
     map.__gpsAccuracy.setCenter(position);
     map.__gpsAccuracy.setRadius(accuracy);
   }
+}
+
+function getAccuracyLabel(accuracy: number) {
+  if (accuracy <= 25) return 'GPS preciso';
+  if (accuracy <= 80) return 'GPS aproximado';
+  return 'GPS com baixa precisao';
+}
+
+function getGpsErrorLabel(error: GeolocationPositionError) {
+  if (error.code === error.PERMISSION_DENIED) return 'Permissao de GPS negada';
+  if (error.code === error.POSITION_UNAVAILABLE) return 'GPS indisponivel';
+  if (error.code === error.TIMEOUT) return 'GPS demorou para responder';
+  return 'Erro no GPS';
+}
+
+function buildGpsTitle(accuracy: number) {
+  return `Sua posicao GPS | precisao aproximada: ${Math.round(accuracy)}m`;
 }
 
 function buildDeviceIcon(maps: GoogleMapsApi, alert: boolean) {
