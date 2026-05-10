@@ -1,0 +1,92 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #020617;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 30% 20%, rgba(37, 99, 235, 0.18), transparent 32rem),
+    linear-gradient(145deg, #020617 0%, #06111f 46%, #020617 100%);
+  color: #e5f1ff;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+.gm-style .gm-style-iw-c {
+  background: rgba(4, 12, 25, 0.96);
+  border: 1px solid rgba(56, 189, 248, 0.32);
+  border-radius: 8px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.45);
+  color: #e5f1ff;
+  padding: 0;
+}
+
+.gm-style .gm-style-iw-d {
+  overflow: auto !important;
+}
+
+.google-map-popup {
+  display: grid;
+  gap: 6px;
+  min-width: 220px;
+  padding: 12px;
+  color: #cbd5e1;
+  font-size: 12px;
+}
+
+.google-map-popup strong {
+  color: #e0f2fe;
+  font-size: 14px;
+}
+
+.glass-panel {
+  background: linear-gradient(180deg, rgba(8, 20, 38, 0.82), rgba(3, 10, 24, 0.7));
+  border: 1px solid rgba(56, 189, 248, 0.18);
+  backdrop-filter: blur(18px);
+  box-shadow: 0 20px 70px rgba(0, 0, 0, 0.32);
+}
+
+.tactical-grid {
+  background-image:
+    linear-gradient(rgba(56, 189, 248, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(56, 189, 248, 0.08) 1px, transparent 1px);
+  background-size: 48px 48px;
+}
+
+.device-marker {
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  border: 2px solid #dbeafe;
+  background: #38bdf8;
+  box-shadow: 0 0 0 8px rgba(56, 189, 248, 0.18), 0 0 28px rgba(56, 189, 248, 0.7);
+  cursor: pointer;
+  transition: transform 180ms ease;
+}
+
+.device-marker:hover {
+  transform: scale(1.12);
+}
+
+.device-marker.alert {
+  background: #ef4444;
+  box-shadow: 0 0 0 8px rgba(239, 68, 68, 0.18), 0 0 28px rgba(239, 68, 68, 0.74);
+}
